@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Database (SQLite)
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build
+frontend/dist/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

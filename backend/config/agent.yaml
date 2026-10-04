@@ -1,0 +1,62 @@
+# === Session Limits ===
+session:
+  max_turns: 12
+  max_inbound_per_hour: 20
+  turn_timeout_seconds: 6
+  max_tool_calls_per_turn: 4
+  max_llm_calls_per_turn: 3
+  llm_call_alert_threshold: 6
+
+# === Verification Levels ===
+verification:
+  v0: phone_match
+  v1: v0_plus_button_confirm
+  v2: v1_plus_payment_verify
+
+# === Tool Rate Limits ===
+tool_limits:
+  writes_per_order_per_day: 3
+  address_edits_per_order: 2
+  max_deferrals: 3
+  max_rider_nudges_per_attempt: 1
+  max_rider_calls_per_attempt: 1
+  max_open_tickets_per_order_per_type: 1
+  max_open_callbacks: 2
+  payment_link_expiry_minutes: 30
+  delivery_note_max_chars: 120
+  max_photos_per_complaint: 3
+  pickup_code_resend_max: 2
+  pickup_hold_days: 3
+
+# === Location ===
+location:
+  max_pin_from_hub_km: 15
+
+# === Quiet Hours (proactive only) ===
+quiet_hours:
+  start: "21:00"
+  end: "08:00"
+
+# === Callback Hours ===
+callback_hours:
+  start: "09:00"
+  end: "20:00"
+
+# === Pre-router Keywords ===
+pre_router:
+  status_keywords: ["status", "kahan hai", "where", "track", "order status", "kab aayega"]
+  help_keywords: ["help", "madad", "sahayata"]
+  stop_keywords: ["stop", "band karo", "mat bhejo", "unsubscribe"]
+  thanks_keywords: ["thanks", "thank you", "dhanyavaad", "shukriya", "ok", "okay", "theek hai"]
+  greeting_keywords: ["hi", "hello", "namaste", "hey"]
+
+# === Reply Constraints ===
+reply:
+  max_words: 60
+  max_buttons: 3
+  banned_words: ["guarantee", "pakka", "guaranteed", "refund will be", "order cancelled", "ban"]
+
+# === Context Window ===
+context:
+  max_open_orders: 3
+  max_history_turns: 6

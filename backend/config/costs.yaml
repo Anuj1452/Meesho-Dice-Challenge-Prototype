@@ -1,0 +1,53 @@
+# === Model Pricing (per million tokens) ===
+# These MUST be updated to the real prices of the chosen model.
+# Current: GPT-4o-mini placeholder prices
+model_pricing:
+  provider: openai
+  model: gpt-4o-mini
+  input_per_million_tokens_usd: 0.15
+  cached_input_per_million_tokens_usd: 0.075
+  output_per_million_tokens_usd: 0.60
+  usd_to_inr: 85
+
+# === Whisper Pricing ===
+whisper_pricing:
+  per_minute_usd: 0.006
+
+# === WhatsApp Pricing ===
+whatsapp:
+  utility_template_base_inr: 0.115
+  gst_percent: 18
+  # effective per template: 0.115 * 1.18 = 0.136
+
+# === RTO Cost ===
+rto:
+  rto_cost_inr: 149
+  forward_cost_inr: 50
+  averted_rto_saving_inr: 99
+
+# === COD to Online ===
+cod_to_online:
+  online_pay_discount_rs: 10
+  expected_rto_reduction_pct: 15
+
+# === Last Mile ===
+last_mile:
+  cost_per_delivery_inr: 21
+
+# === Self Pickup ===
+self_pickup:
+  pickup_handling_fee_rs: 0  # To be decided with Valmo ops
+  self_pickup_cod_allowed: true
+
+# === Tier Mix (per 1000 orders) ===
+tier_mix:
+  low_pct: 35
+  medium_pct: 45
+  high_pct: 20
+  morning_pings: 650  # medium + high
+
+# === Average Token Usage per LLM Call ===
+avg_tokens_per_call:
+  cached_input: 3000
+  fresh_input: 800
+  output: 120
