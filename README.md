@@ -1,6 +1,6 @@
-# Valmo Mitra AI — Meesho DICE Challenge Prototype
+# Valmo Mitra AI - Meesho DICE Challenge Prototype
 
-> **SIMULATED prototype** — built for the Meesho DICE Challenge. It uses seeded data and mocked Meesho, payment, and WhatsApp integrations; it is not connected to Meesho production systems.
+> **SIMULATED prototype** - built for the Meesho DICE Challenge. It uses seeded data and mocked Meesho, payment, and WhatsApp integrations; it is not connected to Meesho production systems.
 
 Valmo Mitra is a conversational delivery assistant for Meesho's Valmo logistics network. It helps customers resolve delivery issues in Hinglish, keeps riders’ manifests current, and gives hub operations a view of exceptions—all while enforcing deterministic guardrails around sensitive actions.
 
