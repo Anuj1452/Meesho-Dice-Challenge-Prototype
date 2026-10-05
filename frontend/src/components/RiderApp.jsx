@@ -44,12 +44,23 @@ export default function RiderApp() {
 
   const handleOutcome = async (orderId, outcome, reason = null) => {
     try {
-      await fetch(`/api/rider/outcome/${MOCK_RIDER_ID}`, {
+      let otp = null;
+      let response = await fetch(`/api/rider/outcome/${MOCK_RIDER_ID}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: orderId, outcome, reason })
+        body: JSON.stringify({ order_id: orderId, outcome, reason, otp })
       });
-      showToast(`Outcome saved: ${outcome}`);
+      let data = await response.json();
+      if (data.requires_otp) {
+        otp = window.prompt('Enter the 4-digit OTP shown in the customer WhatsApp chat:');
+        if (!otp) return;
+        response = await fetch(`/api/rider/outcome/${MOCK_RIDER_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order_id: orderId, outcome, reason, otp })
+        });
+        data = await response.json();
+      }
+      showToast(data.success ? `Outcome saved: ${outcome}` : (data.message || 'Outcome could not be saved'));
       fetchRiderData(false);
     } catch (e) {
       console.error(e);
@@ -238,6 +249,7 @@ export default function RiderApp() {
                       <button 
                         className={`btn-missed-call ${stop.missed_call_count >= 3 ? 'exhausted' : ''}`}
                         onClick={() => handleMissedCall(stop.order_id)}
+                        disabled={stop.missed_call_count >= 3}
                         title="Click if user did not answer call"
                       >
                         📵 No Answer ({stop.missed_call_count || 0}/3)

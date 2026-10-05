@@ -175,7 +175,8 @@ def mark_outcome(
     order_id: str,
     rider_id: str,
     outcome: str,
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
+    otp: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Mark outcome of a delivery stop (§5.2, §14).
     Outcomes:
@@ -193,6 +194,16 @@ def mark_outcome(
     now = datetime.now(timezone.utc)
 
     if "delivered" in norm_outcome:
+        otp_required = bool(order.is_cod or (order.amount or 0) >= 1000)
+        if otp_required:
+            if not order.delivery_otp:
+                order.delivery_otp = "4821"  # fixed, explicitly simulated demo OTP
+                order.otp_sent_at = now
+                _send_otp_message(db, order)
+                db.commit()
+                return {"success": False, "requires_otp": True, "message": "OTP required. It was sent to the customer's WhatsApp chat.", "order_id": order.order_id}
+            if otp != order.delivery_otp:
+                return {"success": False, "requires_otp": True, "message": "Invalid delivery OTP. Ask the customer after handing over the parcel.", "order_id": order.order_id}
         order.status = OrderState.DELIVERED.value
         order.delivered_at = now
         if order.is_cod:
@@ -236,6 +247,19 @@ def mark_outcome(
         "timestamp": now.isoformat(),
         "label": "SIMULATED",
     }
+
+
+def _send_otp_message(db: Session, order: Order) -> None:
+    """Deliver a simulated OTP to the isolated customer chat session."""
+    session = _get_or_create_customer_session(db, order.customer)
+    if session:
+        db.add(ChatMessage(
+            session_id=session.session_id,
+            role="assistant",
+            content="Aapka delivery OTP hai 4821. Rider ko parcel lene ke baad hi ye OTP dein.",
+            message_type="template",
+            timestamp=datetime.now(timezone.utc),
+        ))
 
 
 def report_problem(
@@ -370,20 +394,53 @@ def record_missed_call(db: Session, order_id: str, rider_id: str) -> Dict[str, A
     now = datetime.now(timezone.utc)
     order.updated_at = now
 
+    if attempt < 3:
+        db.commit()
+        return {
+            "success": True,
+            "order_id": order_id,
+            "missed_call_count": attempt,
+            "alert_sent": False,
+            "message": f"Missed call attempt {attempt}/3 logged. No WhatsApp alert sent yet.",
+        }
+
+    # On 3rd attempt, evaluate location discrepancy before accepting a no-answer outcome (R-14).
+    order.status = OrderState.FAILED_ATTEMPT.value
+    rider_lat = rider.lat if rider and rider.lat is not None else 28.7041
+    rider_lng = rider.lng if rider and rider.lng is not None else 77.1025
+    customer_lat = order.lat if order.lat is not None else 28.7041
+    customer_lng = order.lng if order.lng is not None else 77.1025
+    distance_m = int(_haversine_km(rider_lat, rider_lng, customer_lat, customer_lng) * 1000)
+    fake_attempt = distance_m > 150
+    if fake_attempt:
+        db.add(Ticket(
+            ticket_id=f"TKT-R14-{order.order_id[-6:]}", order_id=order.order_id,
+            category="fake_door_attempt", severity="P1", status="open",
+            summary=f"Rule R-14 GPS discrepancy: rider was {distance_m}m from customer pin after 3 no-answer attempts.",
+        ))
+
+    # Record tracking event
+    tracking = TrackingEvent(
+        order_id=order.order_id,
+        status=order.status,
+        location=f"Last-mile DC ({order.serving_center_id or 'Hub'})",
+        description=f"[SIMULATED] Delivery failed: Customer did not answer call (3 attempts)",
+        timestamp=now,
+    )
+    db.add(tracking)
+
     cust_name = order.customer.name.split()[0] if order.customer and order.customer.name else "Customer"
     clean_prod = (order.product_name or "Parcel").replace("[SIMULATED] ", "")
 
     message_text = (
-        f"⚠️ Namaste {cust_name}! Rider {rider_name} ne aapko parcel ({clean_prod}) ke liye call kiya tha, "
-        f"par baat nahi ho payi (Attempt {attempt}/3).\n\n"
-        f"Kripya batayein aap kya chahte hain:"
+        f"⚠️ Namaste {cust_name}! Rider {rider_name} ne aapko parcel ({clean_prod}) ke liye aaj 3 baar call kiya tha, "
+        f"par aapne answer nahi kiya (Attempt 3/3).\n\n"
+        f"Kripya batayein kya hua tha:"
     )
 
     buttons = [
-        {"id": "btn_call_rider", "title": "📞 Call Rider Back"},
-        {"id": "btn_leave_neighbor", "title": "🏠 Padosi/Security ko dein"},
-        {"id": "btn_not_today", "title": "📅 Kal aaiye"},
-        {"id": "btn_alt_number", "title": "📱 Alternate Number"}
+        {"id": "btn_was_available", "title": "I was available (Didn't get call)"},
+        {"id": "btn_was_busy", "title": "I was busy (Not available)"},
     ]
 
     session = _get_or_create_customer_session(db, order.customer)
@@ -406,8 +463,17 @@ def record_missed_call(db: Session, order_id: str, rider_id: str) -> Dict[str, A
         "order_id": order_id,
         "missed_call_count": attempt,
         "alert_sent": True,
+        "fake_door_attempt_flagged": fake_attempt,
+        "gps_distance_m": distance_m,
         "message": f"Missed call attempt {attempt}/3 logged. WhatsApp alert sent to customer.",
     }
+
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    from math import radians, sin, cos, asin, sqrt
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return 6371 * 2 * asin(sqrt(a))
 
 
 def suggest_route_order(db: Session, rider_id: str) -> Dict[str, Any]:

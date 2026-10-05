@@ -110,6 +110,8 @@ class Order(Base):
     deferral_count = Column(Integer, default=0)
     address_edit_count = Column(Integer, default=0)
     missed_call_count = Column(Integer, default=0)
+    delivery_otp = Column(String(4))
+    otp_sent_at = Column(DateTime)
     customer_response_status = Column(String(50), default="")
 
     # Rider
@@ -143,6 +145,8 @@ class Rider(Base):
     phone_hash = Column(String(64))
     hub_id = Column(String(20))
     active = Column(Boolean, default=True)
+    lat = Column(Float)
+    lng = Column(Float)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     orders = relationship("Order", back_populates="rider")
@@ -341,6 +345,21 @@ def init_db(database_url: str = None):
     """Create all tables."""
     engine = get_engine(database_url)
     Base.metadata.create_all(bind=engine)
+    # SQLite's create_all does not add fields to an existing demo database.
+    # Keep the local prototype forward-compatible without discarding user data.
+    if "sqlite" in database_url:
+        with engine.begin() as connection:
+            existing = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(orders)")}
+            for name, definition in {
+                "delivery_otp": "VARCHAR(4)",
+                "otp_sent_at": "DATETIME",
+            }.items():
+                if name not in existing:
+                    connection.exec_driver_sql(f"ALTER TABLE orders ADD COLUMN {name} {definition}")
+            rider_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(riders)")}
+            for name in ("lat", "lng"):
+                if name not in rider_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE riders ADD COLUMN {name} FLOAT")
     return engine
 
 

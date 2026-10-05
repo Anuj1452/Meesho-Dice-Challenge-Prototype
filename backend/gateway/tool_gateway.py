@@ -154,11 +154,20 @@ class ToolGateway:
 
         # 3. Order-specific checks
         order_id = args.get("order_id")
+        order = None
         if order_id:
             order = self.db.query(Order).filter(Order.order_id == order_id).first()
-            if not order:
-                return GatewayResult(False, "Order not found.")
+        elif role == UserRole.CUSTOMER and actor_id:
+            from backend.models.database import Customer
+            customer = self.db.query(Customer).filter(Customer.phone_hash == actor_id).first()
+            if customer:
+                terminal = {OrderState.DELIVERED.value, OrderState.RETURNED.value}
+                order = self.db.query(Order).filter(
+                    Order.customer_id == customer.id,
+                    Order.status.notin_(terminal)
+                ).order_by(Order.ordered_at.desc()).first()
 
+        if order:
             # Ownership check (customer role)
             if role == UserRole.CUSTOMER:
                 from backend.models.database import Customer
@@ -202,7 +211,7 @@ class ToolGateway:
                      "An alternate receiver can be set."],
                 )
 
-            if order.address_edit_count >= 2:
+            if (order.address_edit_count or 0) >= 2:
                 return GatewayResult(
                     False,
                     "Maximum address edits (2) reached for this order.",

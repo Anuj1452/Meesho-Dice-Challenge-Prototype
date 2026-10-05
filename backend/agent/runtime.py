@@ -1,10 +1,11 @@
-"""Agent runtime (§3): orchestrates the turn pipeline.
-Pre-router → LLM with tools → Gateway → Post-validator → Send.
+﻿"""Agent runtime (Â§3): orchestrates the turn pipeline.
+Pre-router â†’ LLM with tools â†’ Gateway â†’ Post-validator â†’ Send.
 """
 
 import os
 import json
 import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from backend.nlu.llm_client import get_llm_client, LLMResult
 from backend.agent.pre_router import route as pre_route, PreRouterResult
 from backend.agent.post_validator import validate_reply, ValidationResult
 from backend.gateway.tool_gateway import ToolGateway, GatewayResult
+from backend.gateway.tool_gateway import KNOWN_CITIES
 from backend.tools import customer_tools
 from backend.models.database import (
     Customer, Order, ChatSession, ChatMessage, CostTracker,
@@ -21,7 +23,7 @@ from backend.models.database import (
 from backend.models.enums import UserRole, OrderState, STATE_DISPLAY_NAMES
 
 
-# === System prompt (§11) ===
+# === System prompt (Â§11) ===
 SYSTEM_PROMPT = """You are Valmo Mitra, the delivery helper for Meesho customers in India.
 You talk on WhatsApp with people who may be in small towns, on weak networks,
 and often frustrated. Reply in the language and script they use (default:
@@ -54,9 +56,10 @@ RULES:
 - R-25: Payment links come only from create_payment_link. Never ask for card numbers, PINs, OTPs or CVV.
 - R-26: Off-topic: one polite line and redirect. No opinions.
 - R-29: STOP or "band karo" is honoured immediately.
-- R-30: ADDRESS CHANGE (IMPORTANT): The customer is messaging from their registered WhatsApp number, so their identity is already verified — do NOT ask for identity verification. Address changes within the SAME pincode are allowed in ALL active delivery states (including Out for Delivery). Flow: (1) Ask for the new address (same pincode) AND landmark. (2) Ask if the receiver will be the same person or someone else. If someone else (different receiver), ask for that person's name and contact phone number. (3) Read back the complete details and call update_address (with address_text, landmark, receiver_name, receiver_phone). If they want a different city or pincode, explain location lock and offer self-pickup or rider call.
+- R-30: ADDRESS CHANGE (IMPORTANT): The customer is messaging from their registered WhatsApp number, so their identity is already verified â€” do NOT ask for identity verification. Address changes within the SAME pincode are allowed in ALL active delivery states (including Out for Delivery). Flow: (1) Ask for the new address (same pincode) AND landmark. (2) Ask if the receiver will be the same person or someone else. If someone else (different receiver), ask for that person's name and contact phone number. (3) Read back the complete details and call update_address (with address_text, landmark, receiver_name, receiver_phone). A relative landmark answer (for example, that it is unchanged / as before) means preserve the landmark shown in the order context; acknowledge the resolved landmark explicitly, never invent one. If they want a different city or pincode, explain location lock and offer self-pickup or rider call.
+- R-30: ADDRESS CHANGE (IMPORTANT): The customer is messaging from their registered WhatsApp number, so their identity is already verified â€” do NOT ask for identity verification. Address changes within the SAME pincode are allowed in ALL active delivery states (including Out for Delivery). Flow: (1) Validate the proposed location against the order context BEFORE asking for a landmark. If it names another city or pincode, state the order's current city and pincode from context, ask for a corrected full address in that city/pincode and its landmark, and do not call update_address. (2) Otherwise ask for landmark and receiver details where needed. (3) Read back complete details and call update_address. A relative landmark answer (for example, that it is unchanged / as before) means preserve the landmark shown in the order context; acknowledge the resolved landmark explicitly, never invent one. If they want a different city or pincode, explain location lock and offer self-pickup or rider call.
 - R-32: When offering self pickup, state distance band and hours honestly.
-- R-33: NEIGHBOR/ALTERNATE RECEIVER: If customer says leave with neighbour, security, or alternate person — FIRST ask: (a) their full name, AND (b) their door/flat number OR contact number. Only after getting these details, call set_alternate_receiver with the name and add_delivery_note with the address/contact. Never set alternate receiver without getting at least a name and location.
+- R-33: NEIGHBOR/ALTERNATE RECEIVER: If customer says leave with neighbour, security, or alternate person â€” FIRST ask for their full name plus flat/door number or contact number. Interpret a compact next reply containing a name and number in either order using that pending conversation context. A contact number is permitted only in structured set_alternate_receiver data; never put it in add_delivery_note. Never set an alternate receiver without both a name and location/contact.
 - R-34: CALL / TALK TO RIDER: When the customer asks to speak or talk with the rider ("rider se baat karni hai", "rider ko call lagao", etc.), provide the masked dialer number (+91 98765 00000) and tell them they can use the "📞 Call Rider Amit" button.
 
 NEGATIVE ACTION PROTOCOL (cancel/return/refund/replace/"mat bhejo"):
@@ -138,7 +141,7 @@ TOOL_SCHEMAS = [
                     "order_id": {"type": "string"},
                     "slot": {"type": "string", "description": "today, tomorrow, day_after, or specific time like 'kal shaam 4 baje'"},
                 },
-                "required": ["order_id", "slot"],
+                "required": ["slot"],
             },
         },
     },
@@ -161,14 +164,15 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "set_alternate_receiver",
-            "description": "Set an alternate person to receive the delivery (name only)",
+            "description": "Set an alternate person to receive the delivery with a structured contact number",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
                     "name": {"type": "string", "description": "Name of the alternate receiver"},
+                    "contact_phone": {"type": "string", "description": "Their 10-digit phone number; allowed only for this structured receiver record"},
                 },
-                "required": ["order_id", "name"],
+                "required": ["order_id", "name", "contact_phone"],
             },
         },
     },
@@ -322,16 +326,40 @@ class AgentRuntime:
         # Get/create session
         session = self._get_or_create_session(session_id, customer)
 
+        # Audio is transcribed locally in this prototype before routing. The
+        # supplied message is the mock transcript, never an audio URL.
+        if message_type == "audio":
+            message_text = self._transcribe_audio(message_text)
+
+        negative = self._negative_action_response(session, customer, message_text, phone_hash, session_id)
+        if negative:
+            self._save_turn(session, message_text, negative["response_text"], negative["buttons"], "negative_action", message_type)
+            return negative
+
+        # Location consistency is a data-integrity gate, not an LLM choice.
+        # It runs before pre-routing/model inference so every provider sees the
+        # same safe behavior for every customer's order location.
+        location_reply = self._address_location_reply(customer, message_text)
+        if location_reply:
+            self._save_turn(session, message_text, location_reply, [], "address_location_guard", message_type)
+            return {
+                "response_text": location_reply,
+                "buttons": [],
+                "tool_calls_made": [],
+                "pre_routed": True,
+                "llm_calls": 0,
+                "cost_inr": 0.0,
+            }
+
         # Check session limits
         if session.turn_count >= 12:
-            return self._limit_response("12 turns ho gaye. Aapko ek human agent se connect karte hain.",
-                                         session_id)
+            return self._limit_response(session, customer, phone_hash, session_id)
 
         # === Step 2: Pre-router ===
         pre_result = pre_route(message_text, message_type, button_payload, customer_name)
         if pre_result.handled and not pre_result.tool_calls:
             self._save_turn(session, message_text, pre_result.response_text,
-                           pre_result.buttons, "pre_router")
+                           pre_result.buttons, "pre_router", message_type)
             return {
                 "response_text": pre_result.response_text,
                 "buttons": pre_result.buttons,
@@ -352,7 +380,7 @@ class AgentRuntime:
             # Build a response from tool results
             response = self._format_tool_response(pre_result.action, tool_results, customer_name)
             self._save_turn(session, message_text, response["text"], response.get("buttons", []),
-                           "pre_router_with_tools")
+                           "pre_router_with_tools", message_type)
             return {
                 "response_text": response["text"],
                 "buttons": response.get("buttons", []),
@@ -408,7 +436,7 @@ class AgentRuntime:
             if llm_result.text.startswith("[TIMEOUT]") or llm_result.text.startswith("[ERROR]"):
                 return self._fallback_response(session, message_text, session_id, llm_result.text)
 
-            # No tool calls — just text response
+            # No tool calls â€” just text response
             if not llm_result.tool_calls:
                 # Step 7: Post-validate
                 validation = validate_reply(llm_result.text, tool_results_all)
@@ -524,7 +552,8 @@ class AgentRuntime:
             "add_delivery_note": lambda: customer_tools.add_delivery_note(
                 db, clean_args.get("order_id", ""), clean_args.get("note", ""), phone_hash=phone_hash),
             "set_alternate_receiver": lambda: customer_tools.set_alternate_receiver(
-                db, clean_args.get("order_id", ""), clean_args.get("name", ""), phone_hash=phone_hash),
+                db, clean_args.get("order_id", ""), clean_args.get("name", ""),
+                contact_phone=clean_args.get("contact_phone", ""), phone_hash=phone_hash),
             "update_address": lambda: customer_tools.update_address(
                 db, clean_args.get("order_id", ""), clean_args.get("address_text", ""),
                 landmark=clean_args.get("landmark"),
@@ -567,7 +596,11 @@ class AgentRuntime:
         if orders_data.get("open_orders"):
             order_summary = "Customer's open orders:\n"
             for o in orders_data["open_orders"][:3]:
-                order_summary += f"- {o['order_id']}: {o['product']} | {o['amount']} | {o['status_display']} | {o['payment']} | {o['city']}\n"
+                order_summary += (
+                    f"- {o['order_id']}: {o['product']} | {o['amount']} | {o['status_display']} | "
+                    f"{o['payment']} | City: {o['city']} | Address: {o.get('address', '')} | "
+                    f"Pincode: {o.get('pincode', '')} | Landmark: {o.get('landmark', '')}\n"
+                )
             messages.append({"role": "system", "content": order_summary})
 
         # Last 6 turns
@@ -620,14 +653,19 @@ class AgentRuntime:
             }
 
         if action in ("defer_delivery", "set_tomorrow"):
+            scheduled_for = ""
+            if tool_results:
+                res = tool_results[0].get("result", {})
+                scheduled_for = res.get("scheduled_for", "kal")
+            name_part = f" {customer_name}" if customer_name else ""
             return {
-                "text": "Theek hai! 🗓️ Aapka order kal ke liye schedule kar diya gaya hai. Rider aaj nahi aayega aur kal attempt karega.",
+                "text": f"Theek hai{name_part}! Aapka order kal ({scheduled_for}) ke liye reschedule kar diya gaya hai.\n\nRider ko bhi inform kar diya hai - aaj delivery attempt nahi hoga. Kal rider aapke address par aayega.",
                 "buttons": [{"id": "btn_status", "title": "Order status"}],
             }
 
         if action == "leave_neighbor":
             return {
-                "text": "Noted! 🏠 Rider ko instruction bhej di gayi hai: 'Padosi / Security Guard ko de dein'.",
+                "text": "Noted! 🏠  Rider ko instruction bhej di gayi hai: 'Padosi / Security Guard ko de dein'.",
                 "buttons": [{"id": "btn_status", "title": "Order status"}],
             }
 
@@ -662,7 +700,7 @@ class AgentRuntime:
         return clean_text, buttons[:3]
 
     def _fallback_response(self, session, message_text, session_id, error: str) -> dict:
-        """Fallback when LLM fails — button menu + callback offer."""
+        """Fallback when LLM fails â€” button menu + callback offer."""
         response_text = "Abhi kuch problem aa rahi hai. Ye options try karein:"
         buttons = [
             {"id": "btn_status", "title": "Order status"},
@@ -680,8 +718,13 @@ class AgentRuntime:
             "error": error,
         }
 
-    def _limit_response(self, text: str, session_id: str) -> dict:
+    def _limit_response(self, session: ChatSession, customer, phone_hash: str, session_id: str) -> dict:
         """Response when session limits are hit."""
+        order_id = self._active_order_id(customer)
+        if order_id:
+            self._execute_tool("escalate_to_human", {"order_id": order_id, "summary": "Conversation reached 12-turn safety limit."}, phone_hash, session_id)
+        text = "12 turns ho gaye. Aapko ek human agent se connect karte hain."
+        self._save_turn(session, "[session turn limit]", text, [{"id": "btn_callback", "title": "Callback chahiye"}], "turn_limit")
         return {
             "response_text": text,
             "buttons": [{"id": "btn_callback", "title": "Callback chahiye"}],
@@ -697,12 +740,17 @@ class AgentRuntime:
             ChatSession.session_id == session_id
         ).first()
 
+        # A session token belongs to exactly one customer. Reusing a token from
+        # another tab must not expose its context or advance its turn count.
+        if session and session.customer_id != (customer.id if customer else None):
+            raise ValueError("Session does not belong to this customer.")
         if not session:
             session = ChatSession(
                 session_id=session_id,
                 customer_id=customer.id if customer else None,
                 role="customer",
                 verification_level="v0" if customer else "unknown",
+                turn_count=0,
             )
             self.db.add(session)
             self.db.commit()
@@ -710,14 +758,14 @@ class AgentRuntime:
         return session
 
     def _save_turn(self, session: ChatSession, user_msg: str, assistant_msg: str,
-                   buttons: list, source: str):
+                   buttons: list, source: str, message_type: str = "text"):
         """Save messages and increment turn count."""
         # User message
         user_chat = ChatMessage(
             session_id=session.session_id,
             role="user",
             content=user_msg,
-            message_type="text",
+            message_type=message_type,
         )
         self.db.add(user_chat)
 
@@ -734,6 +782,63 @@ class AgentRuntime:
         session.turn_count += 1
         session.updated_at = datetime.now(timezone.utc)
         self.db.commit()
+
+    @staticmethod
+    def _transcribe_audio(transcript: str) -> str:
+        """Deterministic Whisper mock: UI posts a user-visible transcript."""
+        return (transcript or "").strip()
+
+    def _active_order_id(self, customer) -> str:
+        if not customer:
+            return ""
+        order = self.db.query(Order).filter(Order.customer_id == customer.id, Order.status != OrderState.DELIVERED.value).order_by(Order.updated_at.desc()).first()
+        return order.order_id if order else ""
+
+    def _address_location_reply(self, customer, message: str) -> str | None:
+        """Return a factual correction when an address proposes another city/pin."""
+        if not customer:
+            return None
+        text = (message or "").lower()
+        pins = re.findall(r"\b\d{6}\b", text)
+        mentioned_cities = {city for city in KNOWN_CITIES if re.search(rf"\b{re.escape(city)}\b", text)}
+        if not pins and not mentioned_cities:
+            return None
+
+        active_order = self.db.query(Order).filter(
+            Order.customer_id == customer.id,
+            Order.status != OrderState.DELIVERED.value,
+        ).order_by(Order.updated_at.desc()).first()
+        if not active_order:
+            return None
+
+        same_pin = not pins or all(pin == active_order.pincode for pin in pins)
+        expected_city = (active_order.city or "").lower()
+        same_city = not mentioned_cities or all(city == expected_city for city in mentioned_cities)
+        if same_pin and same_city:
+            return None
+
+        return (
+            f"Aapke is order ki delivery location {active_order.city}, {active_order.pincode} mein fixed hai. "
+            f"Kripya {active_order.city}, {active_order.pincode} ke andar Flat/House No., street aur nearest landmark ke saath sahi address bhej dijiye 📍"
+        )
+
+    def _negative_action_response(self, session, customer, message: str, phone_hash: str, session_id: str) -> dict | None:
+        lower = (message or "").lower()
+        triggers = ("cancel", "cancellation", "mat bhejo", "nahi chahiye", "return", "refund", "replace")
+        if not any(token in lower for token in triggers):
+            return None
+        prior = self.db.query(ChatMessage).filter(ChatMessage.session_id == session.session_id, ChatMessage.role == "user").all()
+        count = sum(any(token in (m.content or "").lower() for token in triggers) for m in prior) + 1
+        order_id = self._active_order_id(customer)
+        if count == 1:
+            return {"response_text": "Samajh sakta hoon. Cancel karne ki wajah kya hai? Main delivery kal karwa sakta hoon, address theek kar sakta hoon, ya rider ko note bhej sakta hoon.", "buttons": [{"id":"btn_not_today","title":"Kal deliver karein"},{"id":"btn_change_address","title":"Address badlein"}], "tool_calls_made": [], "pre_routed": True, "llm_calls": 0, "cost_inr": 0.0}
+        if count == 2:
+            if order_id:
+                self._execute_tool("create_ticket", {"order_id": order_id, "category": "cancellation_request", "summary": "Customer insists on cancellation after first assistance offer."}, phone_hash, session_id)
+            return {"response_text": "Out for delivery order WhatsApp se cancel nahi hota. Meesho App mein My Orders → order select karein → Cancel dekhein. Aapki cancellation request support team ko bhej di hai.", "buttons": [{"id":"btn_callback","title":"Callback chahiye"}], "tool_calls_made": ["create_ticket"], "pre_routed": True, "llm_calls": 0, "cost_inr": 0.0}
+        if order_id:
+            self._execute_tool("escalate_to_human", {"order_id": order_id, "summary": "Customer repeated cancellation request three times."}, phone_hash, session_id)
+        return {"response_text": "Aapki request human support ko escalate kar di hai. Team aapse aage madad ke liye connect karegi.", "buttons": [{"id":"btn_callback","title":"Callback chahiye"}], "tool_calls_made": ["escalate_to_human"], "pre_routed": True, "llm_calls": 0, "cost_inr": 0.0}
 
     def _get_customer_id(self, phone_hash: str) -> int:
         customer = self.db.query(Customer).filter(Customer.phone_hash == phone_hash).first()

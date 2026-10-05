@@ -26,6 +26,8 @@ class ChatRequest(BaseModel):
     session_id: str
     phone_hash: str
     message: str
+    message_type: Optional[str] = "text"
+    button_payload: Optional[str] = ""
 
 
 class ChatResponse(BaseModel):
@@ -45,6 +47,8 @@ async def handle_customer_message(request: ChatRequest, db=Depends(get_db)):
         session_id=request.session_id,
         phone_hash=request.phone_hash,
         message_text=request.message,
+        message_type=request.message_type or ("button_reply" if request.button_payload else "text"),
+        button_payload=request.button_payload or "",
     )
     
     return ChatResponse(
@@ -80,24 +84,18 @@ def start_session(phone_hash: str, db=Depends(get_db)):
         session_id = str(uuid.uuid4())
         return {"session_id": session_id, "customer": None, "orders": []}
 
-    # Find existing active session or create new one
-    active_session = db.query(ChatSession).filter(
-        ChatSession.customer_id == customer.id,
-        ChatSession.active == True
-    ).order_by(ChatSession.created_at.desc()).first()
-
-    if active_session:
-        session_id = active_session.session_id
-    else:
-        session_id = f"sess_{customer.phone_hash[:8]}_{int(uuid.uuid4().int % 1000000)}"
-        new_session = ChatSession(
-            session_id=session_id,
-            customer_id=customer.id,
-            role="customer",
-            verification_level="v0",
-        )
-        db.add(new_session)
-        db.commit()
+    # A new tab is a new conversation. Never reuse the customer's latest
+    # session, otherwise turn limits and context leak between tabs.
+    session_id = f"sess_{customer.phone_hash[:8]}_{uuid.uuid4().hex[:12]}"
+    new_session = ChatSession(
+        session_id=session_id,
+        customer_id=customer.id,
+        role="customer",
+        verification_level="v0",
+        turn_count=0,
+    )
+    db.add(new_session)
+    db.commit()
 
     # Pre-fetch orders to show in UI drawer
     orders = db.query(Order).filter(Order.customer_id == customer.id).all()

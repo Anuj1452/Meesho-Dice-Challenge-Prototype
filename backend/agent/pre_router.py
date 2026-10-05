@@ -41,7 +41,7 @@ class PreRouterResult:
         self.response_text = response_text
         self.buttons = buttons or []
         self.action = action
-        self.tool_calls = tool_calls  # Tool calls to execute without LLM
+        self.tool_calls = tool_calls
 
 
 def route(
@@ -56,7 +56,8 @@ def route(
     Handles: button payloads, numbered replies, STOP, status/help keywords,
     thanks, emoji-only messages, greetings.
     """
-    text = message_text.strip().lower()
+    raw_text = message_text.strip()
+    text = raw_text.lower()
 
     # === Button payloads (WhatsApp interactive reply buttons) ===
     if message_type == "button_reply" and button_payload:
@@ -110,33 +111,49 @@ def route(
                 action="greeting",
             )
 
-    # === Interactive Nudge & Missed Call Direct Actions ===
-    if text in ("available today", "main available hoon", "aaj available hoon", "available hoon", "yes available", "aaj aao", "aaj aa jao", "aaj deliver karo"):
+    # If text is long or has specific details (addresses, full questions), ALWAYS pass to LLM
+    if len(text) > 45 or any(char.isdigit() for char in text):
+        return PreRouterResult(handled=False)
+
+    # === Interactive Nudge & Missed Call Short Direct Phrases ===
+    if text in ("was available", "didn't get call", "didnt get call", "call nahi aaya", "available thi", "available tha", "available (didn't get call)"):
+        return _handle_button("btn_was_available", customer_name)
+
+    if text in ("was busy", "not available", "busy tha", "busy thi", "phone silent tha", "busy (not available)"):
+        return _handle_button("btn_was_busy", customer_name)
+
+    if text in ("available today", "main available hoon", "aaj available hoon", "yes available", "aaj aao", "aaj aa jao", "aaj deliver karo", "aaj hi bhej do", "other slot", "aaj"):
         return _handle_button("btn_available_today", customer_name)
 
-    if text in ("not available today", "kal aaiye", "kal aao", "kal aana", "kal deliver karo", "aaj available nahi", "aaj available nahi hoon", "kal"):
+    if text in ("not available today", "kal aaiye", "kal aao", "kal aana", "kal deliver karo", "kal deliver karein", "kal bhejo", "kal aa jao", "aaj available nahi", "kal", "reschedule tomorrow", "tomorrow delivery", "deliver tomorrow", "not today"):
         return _handle_button("btn_not_today", customer_name)
 
-    if text in ("change address", "address change", "pincode address", "address badalna", "naya address"):
+    if text in ("change address", "address change", "address badalna", "naya address", "change delivery address"):
         return _handle_button("btn_change_address", customer_name)
 
-    if any(k in text for k in (
+    if text in (
         "call rider", "rider ko call", "rider number", "rider ka number",
         "call rider back", "rider call", "rider se baat", "talk to rider",
         "call the rider", "rider se baat karni", "rider se baat karo",
-        "rider ko phone", "rider contact", "rider dial", "rider ko bolo"
-    )):
+        "rider ko phone", "rider contact", "rider dial", "open dialer"
+    ):
         return _handle_button("btn_call_rider", customer_name)
 
-    if text in ("padosi", "security", "security guard", "leave with neighbor", "guard ko de do", "padosi ko de do"):
+    if text in ("padosi", "security", "security guard", "leave with neighbor", "guard ko de do", "padosi ko de do", "neighbor"):
         return _handle_button("btn_leave_neighbor", customer_name)
+
+    if text in ("alternate number", "alt number", "doosra number", "dusra number"):
+        return _handle_button("btn_alt_number", customer_name)
+
+    if text in ("callback", "callback chahiye", "call back"):
+        return _handle_button("btn_callback", customer_name)
 
     # === Plain "status" keyword ===
     for kw in STATUS_KEYWORDS:
-        if text == kw or (len(text) < 30 and kw in text):
+        if text == kw:
             return PreRouterResult(
                 handled=True,
-                response_text="",  # Will trigger get_orders tool
+                response_text="",
                 action="status_query",
                 tool_calls=[{"name": "get_orders", "args": {}}],
             )
@@ -146,10 +163,8 @@ def route(
         if text == kw:
             return PreRouterResult(
                 handled=True,
-                response_text="Main in cheezon mein madad kar sakta hoon:",
+                response_text="Zada jankari ya help ke liye kripya apne Meesho App pe 'My Orders' section check karein, ya yahan apna issue batayein.",
                 buttons=[
-                    {"id": "btn_status", "title": "Order status"},
-                    {"id": "btn_address", "title": "Address badalna hai"},
                     {"id": "btn_callback", "title": "Callback chahiye"},
                 ],
                 action="help",
@@ -168,13 +183,32 @@ def _handle_button(payload: str, customer_name: str = "") -> PreRouterResult:
         ),
         "btn_help": PreRouterResult(
             handled=True,
-            response_text="Main in cheezon mein help kar sakta hoon:",
+            response_text="Kaise madad chahiye?",
             buttons=[
-                {"id": "btn_status", "title": "Order status"},
-                {"id": "btn_address", "title": "Address badalna"},
                 {"id": "btn_callback", "title": "Callback chahiye"},
             ],
             action="help",
+        ),
+        "btn_was_available": PreRouterResult(
+            handled=True,
+            response_text="Maafi chahte hain! Ho sakta hai network issue ho. Aap kya chahte hain?",
+            buttons=[
+                {"id": "btn_call_rider", "title": "📞 Call Rider Back"},
+                {"id": "btn_available_today", "title": "🕒 Aaj hi bhej dein (Other slot)"},
+                {"id": "btn_not_today", "title": "📅 Kal aaiye"},
+                {"id": "btn_leave_neighbor", "title": "🏠  Padosi/Security ko dein"}
+            ],
+            action="was_available",
+        ),
+        "btn_was_busy": PreRouterResult(
+            handled=True,
+            response_text="Koi baat nahi! Aap agla delivery attempt kaise chahte hain?",
+            buttons=[
+                {"id": "btn_not_today", "title": "📅 Kal aaiye"},
+                {"id": "btn_leave_neighbor", "title": "🏠  Padosi/Security ko dein"},
+                {"id": "btn_alt_number", "title": "📱 Alternate Number"}
+            ],
+            action="was_busy",
         ),
         "btn_available": PreRouterResult(
             handled=True, response_text="Bahut badiya! 👍 Rider aaj aapke address par deliver karega. Kripya COD amount / OTP ready rakhein.",
@@ -191,14 +225,14 @@ def _handle_button(payload: str, customer_name: str = "") -> PreRouterResult:
         ),
         "btn_not_today": PreRouterResult(
             handled=True,
-            response_text="Theek hai! 🗓️ Aapka order kal ke liye schedule kar diya gaya hai. Rider aaj nahi aayega aur kal attempt karega.",
+            response_text="Theek hai! 📅 Aapka order kal ke liye schedule kar diya gaya hai. Rider aaj nahi aayega aur kal attempt karega.",
             buttons=[{"id": "btn_status", "title": "Order status"}],
             action="defer_delivery",
             tool_calls=[{"name": "set_availability", "args": {"slot": "Tomorrow"}}],
         ),
         "btn_tomorrow": PreRouterResult(
             handled=True,
-            response_text="Aapka order kal ke liye schedule kar diya gaya hai. 🗓️",
+            response_text="Aapka order kal ke liye schedule kar diya gaya hai. 📅",
             action="set_tomorrow",
             tool_calls=[{"name": "set_availability", "args": {"slot": "Tomorrow"}}],
         ),
@@ -215,9 +249,8 @@ def _handle_button(payload: str, customer_name: str = "") -> PreRouterResult:
         ),
         "btn_leave_neighbor": PreRouterResult(
             handled=True,
-            response_text="Noted! 🏠 Rider ko note bhej diya gaya hai: 'Padosi / Security Guard ko de dein'.",
-            action="leave_neighbor",
-            tool_calls=[{"name": "add_delivery_note", "args": {"note": "Padosi / Security Guard ko de dein"}}],
+            response_text="Theek hai. Kripya padosi ya security guard ka Pura Naam aur Flat/House Number ya Mobile Number batayein, taaki rider unhe parcel de sake.",
+            action="leave_neighbor_prompt",
         ),
         "btn_alt_number": PreRouterResult(
             handled=True,
@@ -275,15 +308,16 @@ def _handle_button(payload: str, customer_name: str = "") -> PreRouterResult:
 
     # Check button text matching
     payload_lower = payload.lower()
+    payload_clean = re.sub(r"^[^\w]+|[^\w]+$", "", payload_lower).strip()
     for key, handler in handlers.items():
-        if key.lower() == payload_lower:
+        if key.lower() in (payload_lower, payload_clean):
             return handler
-        if key.replace("btn_", "").replace("_", " ") in payload_lower:
+        clean_key = key.replace("btn_", "").replace("_", " ")
+        if clean_key == payload_lower or clean_key == payload_clean:
             return handler
 
     # Unknown button — pass to LLM
     return PreRouterResult(handled=False)
-
 
 
 def _handle_numbered_reply(number: str) -> PreRouterResult:
@@ -315,10 +349,10 @@ def _is_emoji_only(text: str) -> bool:
     """Check if text contains only emoji."""
     import re
     emoji_pattern = re.compile(
-        "[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
-        "\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FA6F\U00002600-\U000026FF\U0000FE00-\U0000FE0F"
-        "\U0000200D\U00002764\U0000FEFF]+",
+        "[😀-🙏🌀-🗿🚀-🛿"
+        "🇠-🇿✂-➰🤀-🧿"
+        "🨀-🩯☀-⛿︀-️"
+        "‍❤﻿]+",
         re.UNICODE,
     )
     cleaned = emoji_pattern.sub("", text).strip()

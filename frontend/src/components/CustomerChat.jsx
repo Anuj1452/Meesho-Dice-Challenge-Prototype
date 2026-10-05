@@ -295,7 +295,7 @@ export default function CustomerChat() {
     setActiveUserIdx(idx);
   };
 
-  const sendMessage = async (text, isButton = false) => {
+  const sendMessage = async (text, isButton = false, buttonId = '', messageType = 'text') => {
     if (!text.trim() || loading) return;
     
     if (text.includes("Open Dialer") || text.includes("Call Rider") || text.includes("Call Rider Back")) {
@@ -316,7 +316,9 @@ export default function CustomerChat() {
         body: JSON.stringify({
           session_id: sessionId,
           phone_hash: activeUser.phone_hash,
-          message: text
+          message: text,
+          message_type: isButton ? 'button_reply' : messageType,
+          button_payload: buttonId || (isButton ? text : '')
         })
       });
       const data = await response.json();
@@ -335,6 +337,13 @@ export default function CustomerChat() {
       isAtBottomRef.current = true;
       setTimeout(() => scrollToBottom("smooth"), 50);
     }
+  };
+
+  const sendAudio = () => {
+    // Browser audio capture is intentionally mocked; the visible text is the
+    // speech-to-text transcript sent with message_type=audio.
+    const transcript = input.trim() || 'Bhaiya main 5 baje aaunga parcel padosi ko de dena';
+    sendMessage(`🎤 ${transcript}`, false, '', 'audio');
   };
 
   const filteredUsers = DEMO_USERS.filter(u => {
@@ -407,16 +416,16 @@ export default function CustomerChat() {
         <div className="wa-doorbell-sim">
           <h4>Smart Actions</h4>
           <div className="action-button-grid">
-            <button onClick={() => sendMessage("Available Today", true)}>
+            <button onClick={() => sendMessage("Available Today", true, "btn_available_today")}>
               ✅ Available Today
             </button>
-            <button onClick={() => sendMessage("Kal deliver karo", true)}>
+            <button onClick={() => sendMessage("Kal deliver karo", true, "btn_not_today")}>
               🔄 Kal Deliver Karein
             </button>
-            <button onClick={() => sendMessage("Mera address Sector 9 mein House 12 change kar do", true)}>
+            <button onClick={() => sendMessage("Mera address Sector 9 mein House 12 change kar do", true, "btn_change_address")}>
               📍 Change Address
             </button>
-            <button onClick={() => sendMessage("Padosi Sharma ji (Flat 204) ko de do", true)}>
+            <button onClick={() => sendMessage("Padosi Sharma ji (Flat 204) ko de do", true, "btn_leave_neighbor")}>
               🏠 Leave with Neighbor
             </button>
             <button onClick={() => handleCallRider()}>
@@ -475,7 +484,7 @@ export default function CustomerChat() {
                   {m.buttons && m.buttons.length > 0 && (
                     <div className="wa-buttons">
                       {m.buttons.map(btn => (
-                        <button key={btn.id} onClick={() => sendMessage(btn.title, true)}>
+                        <button key={btn.id} onClick={() => sendMessage(btn.title, true, btn.id)}>
                           {btn.title}
                         </button>
                       ))}
@@ -509,7 +518,7 @@ export default function CustomerChat() {
             onKeyDown={e => e.key === 'Enter' && sendMessage(input)}
             disabled={loading}
           />
-          <button className="wa-icon-btn" onClick={() => sendMessage(input)} disabled={loading}>
+          <button className="wa-icon-btn" onClick={() => input.trim() ? sendMessage(input) : sendAudio()} disabled={loading}>
             {loading ? '⏳' : input.trim() ? '➤' : '🎤'}
           </button>
         </div>

@@ -32,12 +32,13 @@ class OutcomeRequest(BaseModel):
     order_id: str
     outcome: str
     reason: Optional[str] = None
+    otp: Optional[str] = None
 
 
 @router.post("/outcome/{rider_id}")
 def mark_delivery_outcome(rider_id: str, request: OutcomeRequest, db=Depends(get_db)):
     """Mark the outcome of a delivery stop."""
-    return rider_tools.mark_outcome(db, request.order_id, rider_id, request.outcome, request.reason)
+    return rider_tools.mark_outcome(db, request.order_id, rider_id, request.outcome, request.reason, request.otp)
 
 
 class ProblemRequest(BaseModel):

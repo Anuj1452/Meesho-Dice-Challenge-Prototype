@@ -1,3 +1,4 @@
+import re
 """Customer agent tools (§5.1).
 Each tool is a function that reads from or writes to the database.
 The gateway authorises every call before it reaches here.
@@ -45,8 +46,10 @@ def get_orders(db: Session, phone_hash: str) -> dict:
             "status": o.status,
             "status_display": STATE_DISPLAY_NAMES.get(OrderState(o.status), o.status),
             "payment": "COD" if o.is_cod else "Prepaid",
+            "address": o.address_text or "",
             "pincode": o.pincode,
             "city": o.city,
+            "landmark": o.landmark or "",
             "ordered_at": o.ordered_at.isoformat() if o.ordered_at else None,
             "is_simulated": o.is_simulated,
         }
@@ -192,35 +195,59 @@ def _resolve_order(db: Session, order_id: str = None, phone_hash: str = None) ->
 
 
 def set_availability(db: Session, order_id: str = None, slot: str = "today", phone_hash: str = None) -> dict:
-    """Set delivery availability slot (§5.1)."""
+    """Set delivery availability slot. Notifies rider via tracking event when rescheduled."""
     order = _resolve_order(db, order_id, phone_hash)
     if not order:
         return {"error": "Order not found."}
 
+    now = datetime.now(timezone.utc)
     order.availability_slot = slot
     slot_lower = slot.lower()
+
     if "today" in slot_lower or "aaj" in slot_lower or "available" in slot_lower:
         order.customer_response_status = "available_today"
+        event = TrackingEvent(
+            order_id=order.order_id,
+            status=order.status,
+            location=order.serving_center_id or "Hub",
+            description="[SIMULATED] Customer confirmed: Available today for delivery",
+            timestamp=now,
+        )
+        db.add(event)
     else:
         order.customer_response_status = "rescheduled_tomorrow"
         order.status = OrderState.SKIPPED_TODAY.value
         order.deferral_count = (order.deferral_count or 0) + 1
+        tomorrow_date = (now + timedelta(days=1)).strftime("%d %b")
+        cust_name = order.customer.name.split()[0] if order.customer and order.customer.name else "Customer"
+        event = TrackingEvent(
+            order_id=order.order_id,
+            status=OrderState.SKIPPED_TODAY.value,
+            location=order.serving_center_id or "Hub",
+            description=f"[SIMULATED] Rider Alert: {cust_name} NOT available today. Deliver tomorrow ({tomorrow_date}). Skip this stop.",
+            timestamp=now,
+        )
+        db.add(event)
 
-    order.updated_at = datetime.now(timezone.utc)
+    order.updated_at = now
     db.commit()
 
     warning = None
-    if order.deferral_count >= 2:
+    if order.deferral_count and order.deferral_count >= 2:
         warning = "Ye aakhri baar reschedule ho sakta hai. Teesri baar defer karne pe order 4th day auto-return ho jayega."
 
+    tomorrow_str = (now + timedelta(days=1)).strftime("%d %b")
+    is_tomorrow = not ("today" in slot_lower or "aaj" in slot_lower or "available" in slot_lower)
     return {
         "success": True,
         "order_id": order.order_id,
         "slot": slot,
         "deferral_count": order.deferral_count,
+        "scheduled_for": tomorrow_str if is_tomorrow else "today",
+        "rider_notified": True,
+        "rider_message": f"Customer not available today. Delivery rescheduled to {tomorrow_str}. Stop skipped on manifest.",
         "warning": warning,
     }
-
 
 def add_delivery_note(db: Session, order_id: str = None, note: str = "", phone_hash: str = None) -> dict:
     """Add structured note for the rider (§5.1)."""
@@ -236,31 +263,70 @@ def add_delivery_note(db: Session, order_id: str = None, note: str = "", phone_h
     return {"success": True, "order_id": order.order_id, "note": note[:120]}
 
 
-def set_alternate_receiver(db: Session, order_id: str = None, name: str = "", phone_hash: str = None) -> dict:
-    """Set alternate receiver name (§5.1)."""
+def set_alternate_receiver(db: Session, order_id: str = None, name: str = "", contact_phone: str = "", phone_hash: str = None) -> dict:
+    """Save an alternate receiver as structured name/contact data."""
     order = _resolve_order(db, order_id, phone_hash)
     if not order:
         return {"error": "Order not found."}
 
-    order.alternate_receiver = name
+    clean_name = " ".join(name.split())
+    phone_digits = re.sub(r"\D", "", contact_phone)
+    if len(clean_name) < 2 or not re.fullmatch(r"[6-9]\d{9}", phone_digits):
+        return {"error": "Alternate receiver ke liye unka naam aur valid 10-digit mobile number chahiye."}
+
+    order.alternate_receiver = f"{clean_name} ({phone_digits})"
     order.customer_response_status = "alt_receiver_added"
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
 
-    return {"success": True, "order_id": order.order_id, "alternate_receiver": name}
+    return {"success": True, "order_id": order.order_id, "alternate_receiver": clean_name, "contact_last4": phone_digits[-4:]}
 
 
 def update_address(db: Session, order_id: str = None, address_text: str = "", landmark: str = None, receiver_name: str = None, receiver_phone: str = None, phone_hash: str = None) -> dict:
-    """Update address within same pincode (§7.3)."""
+    """Update address within same pincode (§7.3). Validates pincode and address validity."""
     order = _resolve_order(db, order_id, phone_hash)
     if not order:
         return {"error": "Order not found."}
+
+    clean_text = address_text.strip()
+    lower_text = clean_text.lower()
+
+    # Reject intent questions or non-address text
+    invalid_patterns = [
+        "change", "badal", "kese", "kaise", "krna", "karna", "update",
+        "hai", "hoga", "karo", "bhejo", "batao", "madad", "help"
+    ]
+    words = re.findall(r"\w+", lower_text)
+    if len(words) <= 3 and any(w in words for w in ["change", "badal", "kese", "kaise", "krna", "karna", "update", "address"]):
+        return {"error": "Ye address nahi hai. Kripya apna pura naya delivery address batayein (Flat/House No., Gali, Landmark)."}
+
+    # A landmark alone is not routable. Do this in the tool as well as NLU so a
+    # provider cannot bypass the delivery-quality rule.
+    has_house_identifier = bool(re.search(r"\b(?:flat|house|h\.?(?:\s*no)?|plot|building|block|floor|door)\s*[-#:]?\s*\d", lower_text))
+    has_street_detail = any(token in lower_text for token in ("gali", "street", "road", "sector", "colony", "nagar", "marg", "residency", "apartment", "pocket"))
+    if len(words) < 4 or not has_house_identifier or not has_street_detail:
+        return {"error": "Kripya house/flat number aur street details bhi batayein taaki rider ko parcel deliver karne mein pareshani na ho 📍", "needs_address_details": True}
+
+    # Pincode validation: same pincode check (§7.3)
+    pincode_match = re.search(r"\b\d{6}\b", clean_text)
+    if pincode_match:
+        extracted_pincode = pincode_match.group(0)
+        if order.pincode and extracted_pincode != order.pincode:
+            return {
+                "error": f"Address sirf same pincode ({order.pincode}) mein change ho sakta hai. Naya pincode ({extracted_pincode}) allowed nahi hai. Dusre pincode ke liye Meesho app se order karein.",
+                "allowed_pincode": order.pincode,
+                "requested_pincode": extracted_pincode
+            }
+
+    # Max edit limit (§7.3: max 2 edits)
+    if order.address_edit_count and order.address_edit_count >= 2:
+        return {"error": "Aap is order ke liye maximum 2 baar address update kar chuke hain. Aur edits allowed nahi hain."}
 
     # Preserve initial address before first update
     if not order.original_address:
         order.original_address = order.address_text
 
-    order.address_text = address_text
+    order.address_text = clean_text
     if landmark:
         order.landmark = landmark
     if receiver_name:
@@ -278,9 +344,10 @@ def update_address(db: Session, order_id: str = None, address_text: str = "", la
         "success": True,
         "order_id": order.order_id,
         "original_address": order.original_address,
-        "new_address": address_text,
+        "new_address": clean_text,
         "landmark": order.landmark or "",
         "alternate_receiver": order.alternate_receiver or "",
+        "pincode": order.pincode,
         "edits_remaining": max(0, 2 - order.address_edit_count),
     }
 
